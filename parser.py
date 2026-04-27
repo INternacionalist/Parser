@@ -2,7 +2,7 @@ import json
 import re
 import signal
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from urllib.parse import quote_plus
 
 from selenium import webdriver
@@ -19,16 +19,36 @@ stop_requested = False
 def signal_handler(signum, frame):
     del signum, frame
     global stop_requested
-    print("\nStop requested. Finishing current step...")
     stop_requested = True
 
 
 signal.signal(signal.SIGINT, signal_handler)
 
 
-CITY_NAME = "Уфа"
-UFA_AREA_ID = 99
-HABR_UFA_PATH = "ufa-175375"
+DEFAULT_CITY = "Уфа"
+CITY_ALIASES = {
+    "уфа": "Уфа",
+    "москва": "Москва",
+    "владивосток": "Владивосток",
+    "санкт-петербург": "Санкт-Петербург",
+    "санкт петербург": "Санкт-Петербург",
+    "питер": "Санкт-Петербург",
+    "екатеринбург": "Екатеринбург",
+    "казань": "Казань",
+    "новосибирск": "Новосибирск",
+}
+CITY_HH_AREAS = {
+    "Уфа": 99,
+    "Москва": 1,
+    "Санкт-Петербург": 2,
+}
+CITY_HABR_PATHS = {
+    "Уфа": "ufa-175375",
+}
+
+CURRENT_CITY = DEFAULT_CITY
+CURRENT_HH_AREA = CITY_HH_AREAS.get(DEFAULT_CITY)
+CURRENT_HABR_PATH = CITY_HABR_PATHS.get(DEFAULT_CITY)
 
 IT_QUERIES = [
     "Python разработчик",
@@ -57,21 +77,6 @@ SOURCE_LABELS = {
     "remotejob": "remote-job.ru",
 }
 
-MONTHS_RU = {
-    "января": 1,
-    "февраля": 2,
-    "марта": 3,
-    "апреля": 4,
-    "мая": 5,
-    "июня": 6,
-    "июля": 7,
-    "августа": 8,
-    "сентября": 9,
-    "октября": 10,
-    "ноября": 11,
-    "декабря": 12,
-}
-
 GRADE_PATTERNS = [
     ("Стажер", [r"\bстаж[её]р\b", r"\bintern\b", r"\btrainee\b"]),
     ("Junior", [r"\bjunior\b", r"\bjr\b", r"\bджун\b", r"\bмладш"]),
@@ -80,11 +85,23 @@ GRADE_PATTERNS = [
     ("Lead", [r"\blead\b", r"\bteam lead\b", r"\bтимлид\b", r"\bруковод"]),
 ]
 
-EMPLOYMENT_PATTERNS = [
-    ("Гибрид", [r"гибрид", r"hybrid"]),
-    ("Удаленка", [r"удал[её]н", r"remote", r"work from home", r"из дома"]),
-    ("Полный день", [r"полный рабочий день", r"полная занятость", r"full[- ]time", r"full time"]),
-]
+
+def normalize_city_name(city: str | None) -> str:
+    value = re.sub(r"\s+", " ", (city or "")).strip()
+    if not value:
+        return DEFAULT_CITY
+    lowered = value.lower()
+    if lowered in CITY_ALIASES:
+        return CITY_ALIASES[lowered]
+    return " ".join(part.capitalize() for part in lowered.split(" "))
+
+
+def set_runtime_city(city: str | None) -> str:
+    global CURRENT_CITY, CURRENT_HH_AREA, CURRENT_HABR_PATH
+    CURRENT_CITY = normalize_city_name(city)
+    CURRENT_HH_AREA = CITY_HH_AREAS.get(CURRENT_CITY)
+    CURRENT_HABR_PATH = CITY_HABR_PATHS.get(CURRENT_CITY)
+    return CURRENT_CITY
 
 
 def make_driver(headless: bool = True) -> webdriver.Chrome:
@@ -115,11 +132,7 @@ def clean_text(value: str | None) -> str:
 
 
 def split_lines(value: str | None) -> list[str]:
-    return [
-        clean_text(line)
-        for line in (value or "").splitlines()
-        if clean_text(line)
-    ]
+    return [clean_text(line) for line in (value or "").splitlines() if clean_text(line)]
 
 
 def normalize_separators(text: str) -> str:
@@ -141,10 +154,31 @@ def has_salary_hint(text: str) -> bool:
     return has_digits and (has_currency or has_range)
 
 
+def is_empty_salary_text(text: str) -> bool:
+    value = clean_text(text).lower()
+    if not value:
+        return True
+    return any(
+        marker in value
+        for marker in [
+            "з.п. не указана",
+            "зп не указана",
+            "зарплата не указана",
+            "уровень зарплаты",
+            "не указана",
+            "не указан",
+        ]
+    )
+
+
 def parse_salary_text(text: str) -> dict:
     text = clean_text(text)
     compact = normalize_separators(text)
 
+    if len(compact) > 30:
+        return {"from": None, "to": None, "currency": None, "text": "Договорная"}
+    if is_empty_salary_text(compact):
+        return {"from": None, "to": None, "currency": None, "text": "Договорная"}
     if not has_salary_hint(compact):
         return {"from": None, "to": None, "currency": None, "text": "Договорная"}
 
@@ -185,102 +219,54 @@ def parse_salary_text(text: str) -> dict:
     }
 
 
-def parse_russian_date(text: str) -> str | None:
-    value = clean_text(text).lower()
-    if not value:
-        return None
-
-    now = datetime.now()
-    hour_match = re.search(r"(\d+)\s*(час|часа|часов)\s*назад", value)
-    minute_match = re.search(r"(\d+)\s*(минуту|минуты|минут|минута)\s*назад", value)
-    day_ago_match = re.search(r"(\d+)\s*(день|дня|дней)\s*назад", value)
-    week_ago_match = re.search(r"(\d+)\s*(неделю|недели|недель)\s*назад", value)
-
-    if minute_match:
-        return (now - timedelta(minutes=int(minute_match.group(1)))).isoformat()
-    if hour_match:
-        return (now - timedelta(hours=int(hour_match.group(1)))).isoformat()
-    if day_ago_match:
-        return (now - timedelta(days=int(day_ago_match.group(1)))).isoformat()
-    if week_ago_match:
-        return (now - timedelta(weeks=int(week_ago_match.group(1)))).isoformat()
-    if "сегодня" in value:
-        time_match = re.search(r"(\d{1,2}):(\d{2})", value)
-        if time_match:
-            return now.replace(
-                hour=int(time_match.group(1)),
-                minute=int(time_match.group(2)),
-                second=0,
-                microsecond=0,
-            ).isoformat()
-        return now.replace(second=0, microsecond=0).isoformat()
-    if "вчера" in value:
-        yesterday = now - timedelta(days=1)
-        time_match = re.search(r"(\d{1,2}):(\d{2})", value)
-        if time_match:
-            return yesterday.replace(
-                hour=int(time_match.group(1)),
-                minute=int(time_match.group(2)),
-                second=0,
-                microsecond=0,
-            ).isoformat()
-        return yesterday.replace(second=0, microsecond=0).isoformat()
-
-    match = re.search(r"(\d{1,2})\s+([а-я]+)(?:\s+(\d{4}))?", value)
-    if not match:
-        return None
-
-    day = int(match.group(1))
-    month = MONTHS_RU.get(match.group(2))
-    year = int(match.group(3)) if match.group(3) else now.year
-    if not month:
-        return None
-
-    time_match = re.search(r"(\d{1,2}):(\d{2})", value)
-    hour = int(time_match.group(1)) if time_match else 0
-    minute = int(time_match.group(2)) if time_match else 0
-
-    try:
-        return datetime(year, month, day, hour, minute).isoformat()
-    except ValueError:
-        return None
+def detect_grade(texts: list[str]) -> str:
+    combined = " ".join(clean_text(text) for text in texts).lower()
+    for label, patterns in GRADE_PATTERNS:
+        if any(re.search(pattern, combined, re.IGNORECASE) for pattern in patterns):
+            return label
+    return "Не указан"
 
 
-def detect_experience(texts: list[str]) -> str:
-    for text in texts:
-        value = clean_text(text)
-        lowered = value.lower()
-        if re.search(r"без\s+опыта", value, re.IGNORECASE):
-            return "Без опыта"
-        if "опыт" not in lowered and "experience" not in lowered:
-            continue
+def detect_employment(texts: list[str]) -> str:
+    combined = " ".join(clean_text(text) for text in texts).lower()
+    if any(re.search(pattern, combined, re.IGNORECASE) for pattern in [r"удал[её]н", r"remote", r"из дома", r"гибрид", r"hybrid"]):
+        return "+ удаленка"
+    return "Офис"
 
-        match = re.search(r"\b(\d{1,2})\s*[-–]\s*(\d{1,2})\b", normalize_separators(value))
-        if match:
-            left = int(match.group(1))
-            right = int(match.group(2))
-            if left <= 10 and right <= 10:
-                return f"{left}-{right}"
 
-        single_match = re.search(r"\bот\s+(\d{1,2})\s+до\s+(\d{1,2})\b", lowered)
-        if single_match:
-            left = int(single_match.group(1))
-            right = int(single_match.group(2))
-            if left <= 10 and right <= 10:
-                return f"{left}-{right}"
-    return "Без опыта"
+def find_salary_text(lines: list[str]) -> str:
+    for line in lines:
+        if has_salary_hint(line):
+            return clean_text(line)
+    return ""
+
+
+def extract_value_after_marker(lines: list[str], marker_variants: list[str], *, reject_empty_salary: bool = False) -> str:
+    normalized_markers = [clean_text(marker).lower().rstrip(":") for marker in marker_variants]
+    for index, line in enumerate(lines):
+        current = clean_text(line)
+        lowered = current.lower().rstrip(":")
+        for marker in normalized_markers:
+            if lowered == marker and index + 1 < len(lines):
+                candidate = clean_text(lines[index + 1])
+                if reject_empty_salary and is_empty_salary_text(candidate):
+                    return ""
+                return candidate
+            if lowered.startswith(marker + ":"):
+                candidate = clean_text(current.split(":", 1)[1])
+                if reject_empty_salary and is_empty_salary_text(candidate):
+                    return ""
+                return candidate
+    return ""
 
 
 def normalize_experience_text(text: str) -> str:
     value = clean_text(text)
     lowered = value.lower()
-
-    if not value:
-        return "Без опыта"
-    if re.search(r"без\s+опыта", lowered):
+    if not value or re.search(r"без\s+опыта", lowered):
         return "Без опыта"
 
-    range_match = re.search(r"\b(?:от\s+)?(\d{1,2})\s*(?:-|–|до)\s*(\d{1,2})\b", normalize_separators(lowered))
+    range_match = re.search(r"\b(?:от\s+)?(\d{1,2})\s*(?:-|до)\s*(\d{1,2})\b", normalize_separators(lowered))
     if range_match:
         left = int(range_match.group(1))
         right = int(range_match.group(2))
@@ -296,81 +282,42 @@ def normalize_experience_text(text: str) -> str:
     return "Без опыта"
 
 
-def detect_grade(texts: list[str]) -> str:
-    combined = " ".join(clean_text(text) for text in texts).lower()
-    for label, patterns in GRADE_PATTERNS:
-        if any(re.search(pattern, combined, re.IGNORECASE) for pattern in patterns):
-            return label
-    return "Не указан"
-
-
-def detect_employment(texts: list[str]) -> str:
-    combined = " ".join(clean_text(text) for text in texts).lower()
-    if any(re.search(pattern, combined, re.IGNORECASE) for pattern in [r"удал[её]н", r"remote", r"из дома"]):
-        return "+ удаленка"
-    if any(re.search(pattern, combined, re.IGNORECASE) for pattern in [r"гибрид", r"hybrid"]):
-        return "+ удаленка"
-    return "Офис"
-
-
-def find_salary_text(lines: list[str]) -> str:
-    for line in lines:
-        if has_salary_hint(line):
-            return clean_text(line)
-    return ""
-
-
-def extract_value_after_marker(lines: list[str], marker_variants: list[str]) -> str:
-    normalized_markers = [clean_text(marker).lower().rstrip(":") for marker in marker_variants]
-
-    for index, line in enumerate(lines):
-        current = clean_text(line)
-        lowered = current.lower().rstrip(":")
-
-        for marker in normalized_markers:
-            if lowered == marker:
-                if index + 1 < len(lines):
-                    return clean_text(lines[index + 1])
-            elif lowered.startswith(marker + ":"):
-                return clean_text(current.split(":", 1)[1])
-    return ""
-
-
 def normalize_vacancy(item: dict) -> dict:
     salary = item.get("salary") or {"from": None, "to": None, "currency": None, "text": "Договорная"}
-    published_text = clean_text(item.get("published_text") or item.get("published_at_text") or item.get("published_at"))
-    published_at = item.get("published_at") or parse_russian_date(published_text) or datetime.now().isoformat()
-
     title = clean_text(item.get("title"))
     url = clean_text(item.get("url"))
     source = item.get("source") or "unknown"
     vacancy_id = clean_text(item.get("id")) or f"{source}:{url or title}"
+
+    experience = clean_text(item.get("experience")) or "Без опыта"
+    if source in {"habr", "remotejob"}:
+        experience = "Нельзя определить"
 
     return {
         "id": vacancy_id,
         "title": title,
         "salary": salary,
         "url": url,
-        "experience": clean_text(item.get("experience")) or "Без опыта",
+        "experience": experience,
         "grade": clean_text(item.get("grade")) or "Не указан",
         "employment": clean_text(item.get("employment")) or "Не указана",
         "source": SOURCE_LABELS.get(source, source),
         "source_key": source,
-        "published_at": published_at,
-        "published_text": published_text or "Не указана",
         "parsed_at": datetime.now().isoformat(),
     }
 
 
 def scrape_hh_query(driver: webdriver.Chrome, query: str) -> list[dict]:
-    url = (
-        "https://hh.ru/search/vacancy"
-        f"?text={quote_plus(query)}"
-        f"&area={UFA_AREA_ID}"
-        "&per_page=50"
-        "&search_field=name"
-    )
-    driver.get(url)
+    search_text = query
+    url = "https://hh.ru/search/vacancy"
+    params = [
+        f"text={quote_plus(search_text)}",
+        "per_page=50",
+        "search_field=name",
+    ]
+    if CURRENT_HH_AREA:
+        params.append(f"area={CURRENT_HH_AREA}")
+    driver.get(f"{url}?{'&'.join(params)}")
 
     try:
         WebDriverWait(driver, 12).until(
@@ -386,7 +333,6 @@ def scrape_hh_query(driver: webdriver.Chrome, query: str) -> list[dict]:
         "article.vacancy-search-item__card, div[data-qa='vacancy-serp__vacancy']",
     )
     results = []
-
     for card in cards:
         try:
             title_el = card.find_element(By.CSS_SELECTOR, "[data-qa='serp-item__title']")
@@ -411,17 +357,7 @@ def scrape_hh_query(driver: webdriver.Chrome, query: str) -> list[dict]:
                 )
             except Exception:
                 experience = ""
-            if not re.search(r"\d+\s*[-–]\s*\d+|без\s+опыта", experience, re.IGNORECASE):
-                experience = detect_experience(card_lines)
-
-            try:
-                published_text = clean_text(
-                    card.find_element(By.CSS_SELECTOR, "span[data-qa='vacancy-serp__vacancy-date']").text
-                )
-            except Exception:
-                published_text = ""
-            if not published_text:
-                published_text = next((line for line in card_lines if parse_russian_date(line)), "")
+            experience = normalize_experience_text(experience)
 
             results.append(
                 normalize_vacancy(
@@ -434,17 +370,15 @@ def scrape_hh_query(driver: webdriver.Chrome, query: str) -> list[dict]:
                         "grade": detect_grade([title] + card_lines),
                         "employment": detect_employment(card_lines),
                         "source": "hh",
-                        "published_text": published_text,
                     }
                 )
             )
         except Exception:
             continue
-
     return results
 
 
-def extract_habr_card_text(driver: webdriver.Chrome, link) -> str:
+def extract_card_text(driver: webdriver.Chrome, link) -> str:
     return driver.execute_script(
         """
         const link = arguments[0];
@@ -464,28 +398,59 @@ def extract_habr_card_text(driver: webdriver.Chrome, link) -> str:
 
 def parse_habr_card(title: str, url: str, block_text: str) -> dict | None:
     lines = split_lines(block_text)
-    if not lines or not title:
+    if not lines or not title or title not in block_text:
         return None
-
-    if title not in block_text:
-        return None
-
     salary_text = find_salary_text(lines)
-    published_text = next((line for line in lines if parse_russian_date(line)), "")
-
     return normalize_vacancy(
         {
             "id": f"habr:{url}",
             "title": title,
             "salary": parse_salary_text(salary_text),
             "url": url,
-            "experience": detect_experience([title] + lines),
+            "experience": "Нельзя определить",
             "grade": detect_grade([title] + lines),
             "employment": detect_employment(lines),
             "source": "habr",
-            "published_text": published_text,
         }
     )
+
+
+def scrape_habr_query(driver: webdriver.Chrome, query: str) -> list[dict]:
+    if CURRENT_HABR_PATH:
+        url = f"https://career.habr.com/vacancies/{CURRENT_HABR_PATH}?q={quote_plus(query)}&type=all"
+    else:
+        url = f"https://career.habr.com/vacancies?q={quote_plus(f'{query} {CURRENT_CITY}')}&type=all"
+    driver.get(url)
+
+    try:
+        WebDriverWait(driver, 12).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, "a[href*='/vacancies/']"))
+        )
+    except Exception:
+        return []
+
+    links = driver.find_elements(By.CSS_SELECTOR, "a[href*='/vacancies/']")
+    results = []
+    seen = set()
+    for link in links:
+        try:
+            title = clean_text(link.text)
+            href = clean_text(link.get_attribute("href"))
+            if not title or not href:
+                continue
+            if "Откликнуться" in title or title == "Вакансии":
+                continue
+            if "/vacancies/skills/" in href or href in seen:
+                continue
+            block_text = extract_card_text(driver, link)
+            item = parse_habr_card(title, href.split("?")[0], block_text)
+            if not item:
+                continue
+            seen.add(href)
+            results.append(item)
+        except Exception:
+            continue
+    return results
 
 
 def scrape_remotejob_query(driver: webdriver.Chrome, query: str) -> list[dict]:
@@ -506,7 +471,6 @@ def scrape_remotejob_query(driver: webdriver.Chrome, query: str) -> list[dict]:
     links = driver.find_elements(By.CSS_SELECTOR, "a[href*='/vacancy/show/']")
     results = []
     seen = set()
-
     for link in links:
         try:
             title = clean_text(link.text)
@@ -514,24 +478,15 @@ def scrape_remotejob_query(driver: webdriver.Chrome, query: str) -> list[dict]:
             if not title or not href or href in seen:
                 continue
 
-            block_text = extract_habr_card_text(driver, link)
+            block_text = extract_card_text(driver, link)
             lines = split_lines(block_text)
             salary_text = extract_value_after_marker(
                 lines,
                 ["Уровень зарплаты", "Зарплата", "Заработная плата"],
+                reject_empty_salary=True,
             )
             if not has_salary_hint(salary_text):
                 salary_text = find_salary_text(lines)
-
-            experience_text = extract_value_after_marker(
-                lines,
-                ["Требуемый опыт работы", "Опыт работы", "Требования к опыту"],
-            )
-            experience_text = normalize_experience_text(experience_text)
-            if experience_text == "Без опыта":
-                experience_text = detect_experience(lines)
-
-            published_text = next((line for line in lines if parse_russian_date(line)), "")
 
             results.append(
                 normalize_vacancy(
@@ -540,59 +495,16 @@ def scrape_remotejob_query(driver: webdriver.Chrome, query: str) -> list[dict]:
                         "title": title,
                         "salary": parse_salary_text(salary_text),
                         "url": href.split("?")[0],
-                        "experience": experience_text,
+                        "experience": "Нельзя определить",
                         "grade": detect_grade([title] + lines),
                         "employment": detect_employment(lines + ["удаленная работа"]),
                         "source": "remotejob",
-                        "published_text": published_text,
                     }
                 )
             )
             seen.add(href)
         except Exception:
             continue
-
-    return results
-
-
-def scrape_habr_query(driver: webdriver.Chrome, query: str) -> list[dict]:
-    url = f"https://career.habr.com/vacancies/{HABR_UFA_PATH}?q={quote_plus(query)}&type=all"
-    driver.get(url)
-
-    try:
-        WebDriverWait(driver, 12).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, "a[href*='/vacancies/']"))
-        )
-    except Exception:
-        return []
-
-    links = driver.find_elements(By.CSS_SELECTOR, "a[href*='/vacancies/']")
-    results = []
-    seen = set()
-
-    for link in links:
-        try:
-            title = clean_text(link.text)
-            href = clean_text(link.get_attribute("href"))
-            if not title or not href:
-                continue
-            if "Откликнуться" in title or title == "Вакансии":
-                continue
-            if "/vacancies/skills/" in href or f"/vacancies/{HABR_UFA_PATH}" in href:
-                continue
-            if href in seen:
-                continue
-
-            block_text = extract_habr_card_text(driver, link)
-            item = parse_habr_card(title, href.split("?")[0], block_text)
-            if not item:
-                continue
-
-            seen.add(href)
-            results.append(item)
-        except Exception:
-            continue
-
     return results
 
 
@@ -603,50 +515,45 @@ SCRAPERS = {
 }
 
 
-def collect_all_vacancies(headless: bool = False, enabled_sources: list[str] | None = None) -> list[dict]:
+def collect_all_vacancies(
+    headless: bool = True,
+    enabled_sources: list[str] | None = None,
+    city: str | None = None,
+) -> list[dict]:
+    set_runtime_city(city)
     sources = enabled_sources or ENABLED_SOURCES
-    print(f"Parsing sources: {', '.join(SOURCE_LABELS.get(src, src) for src in sources)}")
+    print(f"Город: {CURRENT_CITY}")
+    print(f"Источники: {', '.join(SOURCE_LABELS.get(src, src) for src in sources)}")
     driver = make_driver(headless=headless)
     all_vacancies: dict[str, dict] = {}
-
     try:
         for source_key in sources:
             scraper = SCRAPERS.get(source_key)
             if not scraper:
-                print(f"Skipping unknown source: {source_key}")
                 continue
-
-            print(f"\nSource: {SOURCE_LABELS.get(source_key, source_key)}")
+            print(f"\nИсточник: {SOURCE_LABELS.get(source_key, source_key)}")
             for query in IT_QUERIES:
                 if stop_requested:
                     break
-
-                print(f"  {query}")
+                print(f"  {query}...", end=" ", flush=True)
                 items = scraper(driver, query)
-                new_count = 0
-
+                print(f"{len(items)}")
                 for item in items:
                     dedupe_key = item["url"] or item["id"] or item["title"]
                     if dedupe_key not in all_vacancies:
                         all_vacancies[dedupe_key] = item
-                        new_count += 1
-
-                print(f"    found: {len(items)}, new: {new_count}")
-                time.sleep(1.1)
-
+                time.sleep(0.6)
             if stop_requested:
                 break
     finally:
         driver.quit()
 
     if stop_requested:
-        print("Parsing interrupted by user.")
         return []
 
-    unique = list(all_vacancies.values())
-    unique.sort(key=lambda item: item["published_at"], reverse=True)
-    print(f"\nDone. Unique vacancies: {len(unique)}")
-    return unique
+    vacancies = list(all_vacancies.values())
+    print(f"\nСпарсено вакансий: {len(vacancies)}")
+    return vacancies
 
 
 def save_to_json(vacancies: list[dict], filepath: str = "vacancies.json", enabled_sources: list[str] | None = None) -> None:
@@ -654,7 +561,7 @@ def save_to_json(vacancies: list[dict], filepath: str = "vacancies.json", enable
     out = {
         "meta": {
             "total": len(vacancies),
-            "city": CITY_NAME,
+            "city": CURRENT_CITY,
             "sources": [SOURCE_LABELS.get(source, source) for source in sources],
             "parsed_at": datetime.now().isoformat(),
         },
@@ -662,4 +569,3 @@ def save_to_json(vacancies: list[dict], filepath: str = "vacancies.json", enable
     }
     with open(filepath, "w", encoding="utf-8") as file:
         json.dump(out, file, ensure_ascii=False, indent=2)
-    print(f"Saved to {filepath}: {len(vacancies)} vacancies")
