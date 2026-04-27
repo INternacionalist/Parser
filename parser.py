@@ -85,6 +85,265 @@ GRADE_PATTERNS = [
     ("Lead", [r"\blead\b", r"\bteam lead\b", r"\bтимлид\b", r"\bруковод"]),
 ]
 
+# new
+
+CITY_SJ_IDS = {
+    "Уфа": 1084,
+    "Москва": 4,
+    "Санкт-Петербург": 100,
+    "Екатеринбург": 1082,
+    "Казань": 1105,
+    "Новосибирск": 1080,
+    "Владивосток": 1120,
+}
+
+CITY_RABOTA_RU_IDS = {
+    "Уфа": 43,
+    "Москва": 1,
+    "Санкт-Петербург": 2,
+    "Екатеринбург": 3,
+    "Казань": 11,
+    "Новосибирск": 8,
+    "Владивосток": 25,
+}
+
+CITY_ZARPLATA_RU_IDS = {
+    "Уфа": 1084,
+    "Москва": 4,
+    "Санкт-Петербург": 2,
+    "Екатеринбург": 1082,
+    "Казань": 1105,
+    "Новосибирск": 1080,
+    "Владивосток": 1120,
+}
+
+ENABLED_SOURCES = [
+    "hh",
+    "habr",
+    "remotejob",
+    "sj",
+    "rabota_ru",
+    "zarplata_ru",
+]
+
+SOURCE_LABELS = {
+    "hh": "hh.ru",
+    "habr": "career.habr.com",
+    "remotejob": "remote-job.ru",
+    "sj": "SuperJob.ru",
+    "rabota_ru": "Rabota.ru",
+    "zarplata_ru": "Zarplata.ru",
+}
+
+
+CURRENT_SJ_ID = CITY_SJ_IDS.get(CURRENT_CITY)
+CURRENT_RABOTA_RU_ID = CITY_RABOTA_RU_IDS.get(CURRENT_CITY)
+CURRENT_ZARPLATA_RU_ID = CITY_ZARPLATA_RU_IDS.get(CURRENT_CITY)
+
+def set_runtime_city(city: str | None) -> str:
+    global CURRENT_CITY, CURRENT_HH_AREA, CURRENT_HABR_PATH, \
+           CURRENT_SJ_ID, CURRENT_RABOTA_RU_ID, CURRENT_ZARPLATA_RU_ID
+    CURRENT_CITY = normalize_city_name(city)
+    CURRENT_HH_AREA = CITY_HH_AREAS.get(CURRENT_CITY)
+    CURRENT_HABR_PATH = CITY_HABR_PATHS.get(CURRENT_CITY)
+
+    CURRENT_SJ_ID = CITY_SJ_IDS.get(CURRENT_CITY)
+    CURRENT_RABOTA_RU_ID = CITY_RABOTA_RU_IDS.get(CURRENT_CITY)
+    CURRENT_ZARPLATA_RU_ID = CITY_ZARPLATA_RU_IDS.get(CURRENT_CITY)
+    return CURRENT_CITY
+
+
+def scrape_sj_query(driver: webdriver.Chrome, query: str) -> list[dict]:
+    keyword_encoded = quote_plus(query)
+    if CURRENT_SJ_ID:
+        url = f"https://www.superjob.ru/vacancy/search/?keyword={keyword_encoded}&geo[t][0]={CURRENT_SJ_ID}"
+    else:
+        url = f"https://www.superjob.ru/vacancy/search/?keyword={keyword_encoded}"
+
+    driver.get(url)
+    try:
+        WebDriverWait(driver, 12).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, "div._1TocU"))
+        )
+    except Exception:
+        return []
+
+    results = []
+    cards = driver.find_elements(By.CSS_SELECTOR, "div._1TocU")
+
+    for card in cards:
+        try:
+            title_link = card.find_element(By.CSS_SELECTOR, "a._1Iisy")
+            title = clean_text(title_link.text)
+            raw_url = clean_text(title_link.get_attribute("href"))
+            vacancy_url = raw_url.split('?')[0].rstrip('/')
+            vacancy_id = vacancy_url.split('/')[-1].split('.')[0]
+
+            try:
+                company_elem = card.find_element(By.CSS_SELECTOR, "span._3mf50, a._3mf50")
+                company = clean_text(company_elem.text)
+            except Exception:
+                company = "Не указана"
+
+            try:
+                salary_elem = card.find_element(By.CSS_SELECTOR, "span._2EYtA._1Tggv._3tf8z._2CN8W")
+                salary_text = clean_text(salary_elem.text)
+            except Exception:
+                salary_text = ""
+
+            card_text = clean_text(card.text)
+            card_lines = split_lines(card.text)
+
+            results.append(
+                normalize_vacancy(
+                    {
+                        "id": f"sj:{vacancy_id}",
+                        "title": title,
+                        "company": company,
+                        "salary": parse_salary_text(salary_text),
+                        "url": vacancy_url,
+                        "experience": "Нельзя определить",
+                        "grade": detect_grade([title] + card_lines),
+                        "employment": detect_employment([title] + card_lines),
+                        "source": "sj",
+                    }
+                )
+            )
+        except Exception as e:
+            continue
+
+    return results
+
+def scrape_rabota_ru_query(driver: webdriver.Chrome, query: str) -> list[dict]:
+    keyword_encoded = quote_plus(query)
+    if CURRENT_RABOTA_RU_ID:
+        url = f"https://rabota.ru/vacancy/search?query={keyword_encoded}&locationId={CURRENT_RABOTA_RU_ID}"
+    else:
+        url = f"https://rabota.ru/vacancy/search?query={keyword_encoded}"
+
+    driver.get(url)
+    try:
+        WebDriverWait(driver, 12).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, "article.card-card"))
+        )
+    except Exception:
+        return []
+
+    results = []
+    cards = driver.find_elements(By.CSS_SELECTOR, "article.card-card")
+
+    for card in cards:
+        try:
+            title_link = card.find_element(By.CSS_SELECTOR, "a[href*='/vacancy/']")
+            title = clean_text(title_link.text)
+            raw_url = clean_text(title_link.get_attribute("href"))
+            vacancy_url = raw_url.split('?')[0].rstrip('/')
+            vacancy_id = vacancy_url.split('/')[-1]
+
+            try:
+                company_elem = card.find_element(By.CSS_SELECTOR, "a[href*='/company/'] span, span[data-test-id='vacancy-card-long-title-company-name']")
+                company = clean_text(company_elem.text)
+            except Exception:
+                company = "Не указана"
+
+            try:
+                salary_elem = card.find_element(By.CSS_SELECTOR, "span[data-test-id='vacancy-card-compensation']")
+                salary_text = clean_text(salary_elem.text)
+            except Exception:
+                salary_text = ""
+
+            card_text = clean_text(card.text)
+            card_lines = split_lines(card.text)
+
+            results.append(
+                normalize_vacancy(
+                    {
+                        "id": f"rabota_ru:{vacancy_id}",
+                        "title": title,
+                        "company": company,
+                        "salary": parse_salary_text(salary_text),
+                        "url": vacancy_url,
+                        "experience": "Нельзя определить",
+                        "grade": detect_grade([title] + card_lines),
+                        "employment": detect_employment([title] + card_lines),
+                        "source": "rabota_ru",
+                    }
+                )
+            )
+        except Exception as e:
+            continue
+
+    return results
+
+def scrape_zarplata_ru_query(driver: webdriver.Chrome, query: str) -> list[dict]:
+    keyword_encoded = quote_plus(query)
+    if CURRENT_ZARPLATA_RU_ID:
+        url = f"https://zarplata.ru/vacancy/search?query={keyword_encoded}&city_id={CURRENT_ZARPLATA_RU_ID}"
+    else:
+        url = f"https://zarplata.ru/vacancy/search?query={keyword_encoded}"
+
+    driver.get(url)
+    try:
+        WebDriverWait(driver, 12).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, "div.bloko-entity-list-item-ordered"))
+        )
+    except Exception:
+        return []
+
+    results = []
+    cards = driver.find_elements(By.CSS_SELECTOR, "div.bloko-entity-list-item-ordered")
+
+    for card in cards:
+        try:
+            title_link = card.find_element(By.CSS_SELECTOR, "a[href*='/vacancy/']")
+            title = clean_text(title_link.text)
+            raw_url = clean_text(title_link.get_attribute("href"))
+            vacancy_url = raw_url.split('?')[0].rstrip('/')
+            vacancy_id = vacancy_url.split('/')[-1]
+
+            try:
+                company_elem = card.find_element(By.CSS_SELECTOR, "a[href*='/company/'] span, span[data-qa='vacancy-serp__vacancy-employer']")
+                company = clean_text(company_elem.text)
+            except Exception:
+                company = "Не указана"
+
+            try:
+                salary_elem = card.find_element(By.CSS_SELECTOR, "span[data-qa='vacancy-serp__vacancy-compensation'], span.bloko-text_strong")
+                salary_text = clean_text(salary_elem.text)
+            except Exception:
+                salary_text = ""
+
+            card_text = clean_text(card.text)
+            card_lines = split_lines(card.text)
+
+            results.append(
+                normalize_vacancy(
+                    {
+                        "id": f"zarplata_ru:{vacancy_id}",
+                        "title": title,
+                        "company": company,
+                        "salary": parse_salary_text(salary_text),
+                        "url": vacancy_url,
+                        "experience": "Нельзя определить",
+                        "grade": detect_grade([title] + card_lines),
+                        "employment": detect_employment([title] + card_lines),
+                        "source": "zarplata_ru",
+                    }
+                )
+            )
+        except Exception as e:
+            continue
+
+    return results
+
+SCRAPERS = {
+    "hh": scrape_hh_query,
+    "habr": scrape_habr_query,
+    "remotejob": scrape_remotejob_query,
+    "sj": scrape_sj_query,
+    "rabota_ru": scrape_rabota_ru_query,
+    "zarplata_ru": scrape_zarplata_ru_query,
+}
 
 def normalize_city_name(city: str | None) -> str:
     value = re.sub(r"\s+", " ", (city or "")).strip()
