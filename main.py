@@ -2,7 +2,7 @@ import json
 import os
 import sys
 
-from parser import ENABLED_SOURCES, SOURCE_LABELS, collect_all_vacancies, normalize_city_name, save_to_json
+from parser import ENABLED_SOURCES, SOURCE_LABELS, collect_all_vacancies, load_it_queries, normalize_city_name, save_to_json
 
 
 OUTPUT_FILE = "vacancies.json"
@@ -56,9 +56,16 @@ def main() -> None:
     print("IT vacancies aggregator")
     print("=" * 50)
 
+    queries = load_it_queries()
+    print(f"Загружено запросов: {len(queries)} (из info_pars.txt)\n")
+
     city_input = input("Введите город: ").strip()
     city = normalize_city_name(city_input)
-    print(f"Выбран город: {city}\n")
+    print(f"Выбран город: {city}")
+
+    limit_raw = input("Макс. вакансий на запрос (Enter = без лимита): ").strip()
+    max_per_query = int(limit_raw) if limit_raw.isdigit() and int(limit_raw) > 0 else None
+    print()
 
     if os.path.exists(OUTPUT_FILE):
         try:
@@ -76,6 +83,8 @@ def main() -> None:
         headless=True,
         enabled_sources=ENABLED_SOURCES,
         city=city,
+        max_per_query=max_per_query,
+        it_queries=queries,
     )
     if not vacancies:
         print("Не удалось собрать вакансии.")

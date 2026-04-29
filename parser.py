@@ -12,6 +12,9 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 from webdriver_manager.chrome import ChromeDriverManager
 
+from common import humanize_age
+from scrapers import SCRAPERS as MODULE_SCRAPERS
+
 
 stop_requested = False
 
@@ -65,6 +68,15 @@ IT_QUERIES = [
     "Системный администратор",
 ]
 
+
+def load_it_queries(filepath: str = "info_pars.txt") -> list[str]:
+    try:
+        with open(filepath, encoding="utf-8") as f:
+            lines = [line.strip() for line in f if line.strip()]
+        return lines if lines else IT_QUERIES
+    except FileNotFoundError:
+        return IT_QUERIES
+
 GRADE_PATTERNS = [
     ("Стажер", [r"\bстаж[её]р\b", r"\bintern\b", r"\btrainee\b"]),
     ("Junior", [r"\bjunior\b", r"\bjr\b", r"\bджун\b", r"\bмладш"]),
@@ -77,12 +89,18 @@ ENABLED_SOURCES = [
     "hh",
     "habr",
     "remotejob",
+    "superjob",
+    "rabotaru",
+    "zarplataru",
 ]
 
 SOURCE_LABELS = {
     "hh": "hh.ru",
     "habr": "career.habr.com",
     "remotejob": "remote-job.ru",
+    "superjob": "superjob.ru",
+    "rabotaru": "rabota.ru",
+    "zarplataru": "zarplata.ru",
 }
 
 
@@ -90,11 +108,17 @@ SOURCE_EMPTY_STREAK_LIMITS = {
     "hh": 4,
     "habr": 4,
     "remotejob": 4,
+    "superjob": 4,
+    "rabotaru": 4,
+    "zarplataru": 999,
 }
 REQUEST_DELAY_BY_SOURCE = {
     "hh": 0.25,
     "habr": 0.2,
     "remotejob": 0.2,
+    "superjob": 0.3,
+    "rabotaru": 0.3,
+    "zarplataru": 0.3,
 }
 
 def set_runtime_city(city: str | None) -> str:
@@ -391,23 +415,37 @@ def normalize_vacancy(item: dict) -> dict:
     salary = item.get("salary") or {"from": None, "to": None, "currency": None, "text": "Договорная"}
     title = clean_text(item.get("title"))
     url = clean_text(item.get("url"))
-    source = item.get("source") or "unknown"
-    vacancy_id = clean_text(item.get("id")) or f"{source}:{url or title}"
+    source_key = item.get("source_key") or item.get("source") or "unknown"
+    vacancy_id = clean_text(item.get("id")) or f"{source_key}:{url or title}"
 
     experience = normalize_experience_text(item.get("experience"))
-    if experience == "Нельзя определить" and source in {"habr", "remotejob"}:
+    if experience == "Нельзя определить" and source_key in {"habr", "remotejob"}:
         experience = "Нельзя определить"
+
+    published_at = clean_text(item.get("published_at"))
+    published_ago = None
+    if published_at:
+        try:
+            published_ago = humanize_age(datetime.fromisoformat(published_at))
+        except Exception:
+            published_ago = None
 
     return {
         "id": vacancy_id,
         "title": title,
+        "company": clean_text(item.get("company")) or None,
         "salary": salary,
         "url": url,
         "experience": experience,
         "grade": clean_text(item.get("grade")) or "Не указан",
         "employment": clean_text(item.get("employment")) or "Не указана",
-        "source": SOURCE_LABELS.get(source, source),
-        "source_key": source,
+        "locations": item.get("locations"),
+        "skills": item.get("skills"),
+        "description": item.get("description"),
+        "published_at": published_at or None,
+        "published_ago": published_ago,
+        "source": SOURCE_LABELS.get(source_key, source_key),
+        "source_key": source_key,
         "parsed_at": datetime.now().isoformat(),
     }
 
@@ -613,22 +651,25 @@ def scrape_remotejob_query(driver: webdriver.Chrome, query: str) -> list[dict]:
     return results
 
 
-SCRAPERS = {
-    "hh": scrape_hh_query,
-    "habr": scrape_habr_query,
-    "remotejob": scrape_remotejob_query,
-}
+SCRAPERS = MODULE_SCRAPERS
 
 
 def collect_all_vacancies(
     headless: bool = True,
     enabled_sources: list[str] | None = None,
     city: str | None = None,
+    max_per_query: int | None = None,
+    it_queries: list[str] | None = None,
 ) -> list[dict]:
     set_runtime_city(city)
     sources = enabled_sources or ENABLED_SOURCES
+    queries = it_queries or IT_QUERIES
     print(f"Город: {CURRENT_CITY}")
     print(f"Источники: {', '.join(SOURCE_LABELS.get(src, src) for src in sources)}")
+    if max_per_query:
+        print(f"Лимит: {max_per_query} вакансий на запрос")
+    else:
+        print("Лимит: без ограничений")
     driver = make_driver(headless=headless)
     all_vacancies: dict[str, dict] = {}
     try:
@@ -638,20 +679,32 @@ def collect_all_vacancies(
                 continue
             print(f"\nИсточник: {SOURCE_LABELS.get(source_key, source_key)}")
             empty_streak = 0
-            for query in IT_QUERIES:
+            for query in queries:
                 if stop_requested:
                     break
                 print(f"  {query}...", end=" ", flush=True)
-                items = scraper(driver, query)
+                if source_key == "hh":
+                    items = scraper(driver, query, hh_area=CURRENT_HH_AREA, max_per_query=max_per_query)
+                elif source_key == "habr":
+                    items = scraper(driver, query, habr_path=CURRENT_HABR_PATH, city=CURRENT_CITY, max_per_query=max_per_query)
+                elif source_key == "superjob":
+                    items = scraper(driver, query, city=CURRENT_CITY, max_per_query=max_per_query)
+                elif source_key == "rabotaru":
+                    items = scraper(driver, query, city=CURRENT_CITY, max_per_query=max_per_query)
+                elif source_key == "zarplataru":
+                    items = scraper(driver, query, city=CURRENT_CITY, max_per_query=max_per_query)
+                else:
+                    items = scraper(driver, query, max_per_query=max_per_query)
                 print(f"{len(items)}")
                 if items:
                     empty_streak = 0
                 else:
                     empty_streak += 1
                 for item in items:
-                    dedupe_key = item["url"] or item["id"] or item["title"]
+                    normalized = normalize_vacancy(item)
+                    dedupe_key = normalized["url"] or normalized["id"] or normalized["title"]
                     if dedupe_key not in all_vacancies:
-                        all_vacancies[dedupe_key] = item
+                        all_vacancies[dedupe_key] = normalized
                 if empty_streak >= SOURCE_EMPTY_STREAK_LIMITS.get(source_key, 4):
                     print(f"  Пропускаю остаток запросов: подряд пусто {empty_streak} раз(а)")
                     break
@@ -682,3 +735,25 @@ def save_to_json(vacancies: list[dict], filepath: str = "vacancies.json", enable
     }
     with open(filepath, "w", encoding="utf-8") as file:
         json.dump(out, file, ensure_ascii=False, indent=2)
+
+
+def main() -> None:
+    queries = load_it_queries()
+    print(f"Загружено запросов: {len(queries)} (из info_pars.txt)")
+
+    city_raw = input("Город (Enter = Уфа): ").strip() or None
+    limit_raw = input("Макс. вакансий на запрос (Enter = без лимита): ").strip()
+    max_per_query = int(limit_raw) if limit_raw.isdigit() and int(limit_raw) > 0 else None
+
+    vacancies = collect_all_vacancies(
+        city=city_raw,
+        max_per_query=max_per_query,
+        it_queries=queries,
+    )
+    if vacancies:
+        save_to_json(vacancies, enabled_sources=ENABLED_SOURCES)
+        print("Сохранено в vacancies.json")
+
+
+if __name__ == "__main__":
+    main()
